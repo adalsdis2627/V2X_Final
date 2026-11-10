@@ -1,38 +1,157 @@
-name: Deploy to AWS ECR
+name: Test, build and deploy V2X
 
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
       - name: Test
         run: |
-          chmod +x test.sh
-          ./test.sh
+          pip install -r requirements.txt pytest
+          pytest test_v2x.py
 
       - name: AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: ECR
+      - name: ECR login
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Image to Amazon ECR
+      - name: Build and push images
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.AWS_REPOSITORY }}
-          IMAGE_TAG: latest
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          for target in rsu service; do
+            repo="v2x-$target"
+            aws ecr describe-repositories --repository-names "$repo" >/dev/null 2>&1 \
+              || aws ecr create-repository --repository-name "$repo" >/dev/null
+            docker build --target "$target" -t "$ECR_REGISTRY/$repo:$IMAGE_TAG" .
+            docker push "$ECR_REGISTRY/$repo:$IMAGE_TAG"
+          done
+
+      - name: Create messaging and persistence
+        run: |
+          DLQ_URL=$(aws sqs create-queue --queue-name v2x-events-dlq --query QueueUrl --output text)
+          DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names QueueArn \
+            --query Attributes.QueueArn --output text)
+          ATTRS=$(jq -cn --arg arn "$DLQ_ARN" '{
+            VisibilityTimeout: "30",
+            MessageRetentionPeriod: "86400",
+            RedrivePolicy: ({deadLetterTargetArn: $arn, maxReceiveCount: 5} | tojson)
+          }')
+          aws sqs create-queue --queue-name v2x-events --attributes "$ATTRS" >/dev/null
+
+          TOPIC_ARN=$(aws sns create-topic --name v2x-alerts --query TopicArn --output text)
+          POLICY='{"http":{"defaultHealthyRetryPolicy":{"minDelayTarget":1,"maxDelayTarget":20,"numRetries":10,"numNoDelayRetries":0,"numMinDelayRetries":0,"numMaxDelayRetries":0,"backoffFunction":"linear"},"disableSubscriptionOverrides":false}}'
+          aws sns set-topic-attributes --topic-arn "$TOPIC_ARN" --attribute-name DeliveryPolicy --attribute-value "$POLICY"
+          echo "TOPIC_ARN=$TOPIC_ARN" >> "$GITHUB_ENV"
+
+          if ! aws dynamodb describe-table --table-name v2x >/dev/null 2>&1; then
+            aws dynamodb create-table --table-name v2x --billing-mode PAY_PER_REQUEST \
+              --attribute-definitions AttributeName=pk,AttributeType=S \
+              --key-schema AttributeName=pk,KeyType=HASH >/dev/null
+            aws dynamodb wait table-exists --table-name v2x
+          fi
+
+      - name: Create EC2 instances
+        run: |
+          SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values=v2x-sg \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$SG_ID" = "None" ]; then
+            SG_ID=$(aws ec2 create-security-group --group-name v2x-sg \
+              --description "V2X lab: SSH, MQTT, SNS HTTP, dashboard" --query GroupId --output text)
+          fi
+          for port in 22 1883 8080 5000; do
+            aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp \
+              --port "$port" --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+          done
+
+          AMI_ID=$(aws ec2 describe-images --owners amazon \
+            --filters 'Name=name,Values=al2023-ami-2023*-x86_64' Name=state,Values=available \
+            --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
+          USER_DATA=$'#!/bin/bash\ndnf install -y docker\nsystemctl enable --now docker\n'
+
+          for name in v2x-rsu1 v2x-rsu2 v2x-service; do
+            read -r ID STATE <<< "$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=$name" Name=instance-state-name,Values=pending,running,stopping,stopped \
+              --query 'Reservations[0].Instances[0].[InstanceId,State.Name]' --output text)"
+            if [ "$ID" = "None" ]; then
+              ID=$(aws ec2 run-instances --image-id "$AMI_ID" --instance-type t3.small --count 1 \
+                --key-name vockey --security-group-ids "$SG_ID" \
+                --iam-instance-profile Name=LabInstanceProfile \
+                --metadata-options HttpEndpoint=enabled,HttpTokens=required,HttpPutResponseHopLimit=2 \
+                --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$name}]" \
+                --user-data "$USER_DATA" --query 'Instances[0].InstanceId' --output text)
+            elif [ "$STATE" = "stopping" ] || [ "$STATE" = "stopped" ]; then
+              aws ec2 wait instance-stopped --instance-ids "$ID"
+              aws ec2 start-instances --instance-ids "$ID" >/dev/null
+            fi
+            aws ec2 wait instance-running --instance-ids "$ID"
+            HOST=$(aws ec2 describe-instances --instance-ids "$ID" \
+              --query 'Reservations[0].Instances[0].PublicDnsName' --output text)
+            VAR=$(echo "${name#v2x-}" | tr '[:lower:]' '[:upper:]')_HOST
+            echo "$VAR=$HOST" >> "$GITHUB_ENV"
+          done
+
+      - name: Deploy containers
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          LAB_SSH_KEY: ${{ secrets.LAB_SSH_KEY }}
+        run: |
+          install -m 600 /dev/null key.pem
+          printf '%s\n' "$LAB_SSH_KEY" > key.pem
+          SSH="ssh -i key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+
+          run_container() {
+            local host=$1 name=$2 repo=$3 options=$4 ready=0
+            for _ in $(seq 1 40); do
+              if $SSH "ec2-user@$host" 'sudo docker info' >/dev/null 2>&1; then ready=1; break; fi
+              sleep 10
+            done
+            [ "$ready" = 1 ] || { echo "Docker no disponible en $host"; exit 1; }
+            $SSH "ec2-user@$host" "aws ecr get-login-password --region $AWS_REGION \
+              | sudo docker login --username AWS --password-stdin $ECR_REGISTRY \
+              && sudo docker pull $ECR_REGISTRY/$repo:$IMAGE_TAG \
+              && (sudo docker rm -f $name || true) \
+              && sudo docker run -d --name $name --restart unless-stopped \
+                 -e AWS_DEFAULT_REGION=$AWS_REGION $options $ECR_REGISTRY/$repo:$IMAGE_TAG"
+          }
+
+          # Las IP cambian entre sesiones del laboratorio: se retiran las suscripciones antiguas.
+          for arn in $(aws sns list-subscriptions-by-topic --topic-arn "$TOPIC_ARN" \
+              --query "Subscriptions[?Protocol=='http' && SubscriptionArn!='PendingConfirmation'].SubscriptionArn" \
+              --output text); do
+            aws sns unsubscribe --subscription-arn "$arn"
+          done
+
+          run_container "$SERVICE_HOST" v2x-service v2x-service "-p 5000:5000"
+          run_container "$RSU1_HOST" rsu1 v2x-rsu "-p 1883:1883 -p 8080:8080 -e RSU_ID=rsu-1 -e PUBLIC_HOST=$RSU1_HOST"
+          run_container "$RSU2_HOST" rsu2 v2x-rsu "-p 1883:1883 -p 8080:8080 -e RSU_ID=rsu-2 -e PUBLIC_HOST=$RSU2_HOST"
+
+          {
+            echo "### V2X desplegado: \`$IMAGE_TAG\`"
+            echo "- Dashboard: http://$SERVICE_HOST:5000"
+            echo "- RSU 1: mqtt://$RSU1_HOST:1883, http://$RSU1_HOST:8080/metrics"
+            echo "- RSU 2: mqtt://$RSU2_HOST:1883, http://$RSU2_HOST:8080/metrics"
+          } >> "$GITHUB_STEP_SUMMARY"
