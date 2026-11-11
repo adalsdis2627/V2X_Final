@@ -47,6 +47,21 @@ Prepara Python 3.10, instala `requirements.txt` y ejecuta `pytest test_v2x.py`.
 | Falla alguna prueba | Un cambio ha roto la lógica. Reprodúcelo en local con `pytest test_v2x.py` |
 | Falla `pip install` | Versión fijada en `requirements.txt` inexistente o caída temporal de PyPI. Relanza o corrige la versión |
 
+**Qué comprueba `test_v2x.py`.** Son 36 pruebas unitarias que se ejecutan en segundos y sin AWS, MQTT ni Docker. DynamoDB, SQS, SNS y el broker se sustituyen por objetos en memoria, así que verifican la lógica del código, no la integración con los servicios reales.
+
+| Bloque | Qué se verifica |
+|---|---|
+| Validación en la RSU | Se rechazan eventos con campos que faltan, tipo de evento desconocido, `source_id` no válido, fecha incorrecta, `payload` que no es un objeto o JSON malformado. Se descartan los `event_id` repetidos |
+| Procesado en la RSU | La telemetría normal se limita a un evento cada 3 s por vehículo, los eventos críticos nunca se filtran y `sudden braking` genera una alerta local aunque el enlace con AWS esté cortado |
+| Buffer y reenvío | Con el enlace cortado los eventos se acumulan y salen en el mismo orden al restaurarlo. Un fallo de envío se reintenta con backoff, y si el buffer se llena se descarta primero la telemetría normal |
+| SNS por HTTP | Confirmación de la suscripción con el `Token`, lectura de notificaciones con `Content-Type: text/plain`, alertas duplicadas retransmitidas una sola vez, alertas para otra RSU ignoradas, topic ajeno rechazado (403) y respuesta 503 con el enlace cortado para que SNS reintente |
+| V2X-SERVICE | Un mismo evento recibido dos veces se guarda una sola vez y cuenta como duplicado. Un mensaje malformado lanza error para que acabe en la DLQ. Un evento antiguo no sobrescribe el estado del vehículo |
+| Reglas de alerta | `road hazard` genera una única alerta dirigida a ambas RSU. La congestión requiere 3 vehículos distintos en la misma ventana de 30 s y se dispara una vez. El `alert_id` es determinista, y una alerta que falló al publicarse se recupera cuando SQS reentrega el evento |
+| API del servicio | `/`, `/api/vehicles`, `/api/alerts` y `/api/metrics` responden con los datos esperados |
+| Simulador | Reparto de vehículos entre RSU, eventos compatibles con la validación de la RSU y con `event_id` único, inyección de pérdida, duplicación y desorden, y contadores que se mantienen aunque el servicio se reinicie |
+
+El funcionamiento del sistema completo no lo cubren estas pruebas. Se comprueba con la prueba en local de la sección 3 y en AWS.
+
 ### Paso 2. Credenciales e inicio de sesión en ECR
 Configura las credenciales de AWS con los secretos e inicia sesión en el registro ECR de la cuenta.
 
@@ -135,6 +150,16 @@ Encuentra las RSU solo, por las etiquetas de las instancias. Por defecto simula 
 | `--burst`, `--burst-period` | Eventos extra por ráfaga y segundos entre ráfagas |
 | `--local` | Usa los contenedores locales y LocalStack en lugar de AWS |
 
+**CSV generados.** Se guardan en `results/`, dentro de la carpeta desde la que se lanza el simulador. Cada ejecución tiene un `run_id`, que se puede fijar con `--run-id` y que también se guarda en DynamoDB con cada evento.
+
+| Fichero | Cuándo se crea | Contenido |
+|---|---|---|
+| `<run_id>_alerts.csv` | En toda ejecución | Una fila por alerta recibida por cada vehículo: vehículo, `alert_id`, tipo, origen (`rsu-1`, `rsu-2` o `cloud`) y latencia en ms desde el evento que la provocó. Ambos instantes los toma el reloj del portátil, así que no hay desfase entre máquinas |
+| `<run_id>_timeline.csv` | Solo en experimentos, uno por repetición | Una muestra por segundo: mensajes en la cola SQS, eventos en el buffer de cada RSU, si el servicio responde y cuántos eventos lleva procesados, y el total pendiente (`backlog`). Sirve para las gráficas de acumulación y vaciado |
+| `<run_id>_summary.csv` | Solo en experimentos, al terminar todas las repeticiones | Una fila por repetición: eventos generados, reenviados por las RSU y guardados en DynamoDB, pérdidas, picos de buffer y de cola, reintentos, duplicados, reentregas, eventos desordenados, mensajes en la DLQ, tiempo de recuperación, coherencia del estado final y p95 de latencia de las alertas locales y de la nube |
+
+Las pérdidas se calculan como eventos reenviados por las RSU menos eventos distintos guardados en DynamoDB. Así, la telemetría que la RSU filtra a propósito no cuenta como perdida.
+
 ### Experimentos
 ```bash
 python vehicle_simulator.py --experiment disconnect --repeat 3
@@ -144,7 +169,7 @@ python vehicle_simulator.py --experiment failure --repeat 3 --ssh-key labsuser.p
 - **`disconnect`:** corta el enlace de `rsu-1` con AWS durante 60 s.
 - **`failure`:** detiene `v2x-service` durante 60 s por SSH.
 
-Los tiempos se ajustan con `--warmup`, `--outage` y `--cooldown`. Por cada repetición se generan `results/<run_id>_timeline.csv` y `_alerts.csv`, y al final un `_summary.csv` con todas.
+Los tiempos se ajustan con `--warmup`, `--outage` y `--cooldown`. Los CSV que generan se describen en el apartado anterior.
 
 En Windows, `ssh` rechaza la clave si otros usuarios pueden leerla. Si aparece `UNPROTECTED PRIVATE KEY FILE`, ejecuta en PowerShell:
 
