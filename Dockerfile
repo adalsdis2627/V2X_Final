@@ -16,5 +16,6 @@ CMD ["sh", "-c", "mosquitto -d -c /etc/mosquitto/v2x.conf && exec python -u rsu.
 # docker build --target service -t v2x-service .
 FROM base AS service
 COPY v2x_service.py .
+COPY templates/ templates/
 EXPOSE 5000
 CMD ["python", "-u", "v2x_service.py"]

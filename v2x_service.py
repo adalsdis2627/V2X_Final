@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 
 from botocore.exceptions import ClientError
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template
 
 REQUIRED_FIELDS = ("event_id", "source_id", "event_type", "event_time")
 
@@ -210,162 +210,13 @@ def sqs_listener(service, sqs, queue_url):
                 print(f"Error procesando mensaje: {exc}")
 
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <style>
-        body { font-family: Arial, sans-serif; background-color: #1a1a24; color: white; text-align: center; margin: 0; padding: 20px; }
-        #canvas-container { margin: 15px auto; display: inline-block; border: 3px solid #444; border-radius: 8px; background-color: #111118; }
-        canvas { display: block; }
-        .vehicle-card { display: inline-block; background: #2a2a3c; padding: 10px 15px; margin: 5px; border-radius: 6px; text-align: left; font-size: 12px; width: 170px; vertical-align: top; }
-        .status-dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; margin-right: 5px; }
-        .normal { background-color: #00ff88; }
-        .danger { background-color: #ff4444; }
-        .events-list { margin: 5px 0 0 0; padding-left: 15px; color: #ffdd57; }
-        .events-list li { font-size: 11px; }
-        #alerts-list { max-width: 900px; margin: 0 auto; text-align: left; font-size: 13px; }
-        .alert-row { background: #4a2130; border-left: 4px solid #ff4444; padding: 5px 10px; margin: 3px 0; }
-    </style>
-</head>
-<body>
-    <h1> Circuito de 4 Carriles</h1>
-    <div id="canvas-container"><canvas id="map" width="700" height="400"></canvas></div>
-    <h2>Alertas recientes</h2>
-    <div id="alerts-list">Sin alertas</div>
-    <h2>Vehículos en línea</h2>
-    <div id="vehicles-list">Esperando datos de la SQS</div>
-
-    <script>
-        const canvas = document.getElementById('map');
-        const ctx = canvas.getContext('2d');
-
-        function drawRoads() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            const laneHeight = canvas.height / 5;
-            
-            for (let i = 1; i <= 4; i++) {
-                let yPos = i * laneHeight;
-                
-                ctx.strokeStyle = "#444455";
-                ctx.lineWidth = 25;
-                ctx.beginPath();
-                ctx.moveTo(50, yPos);
-                ctx.lineTo(canvas.width - 50, yPos);
-                ctx.stroke();
-
-                ctx.strokeStyle = "#ffffff";
-                ctx.lineWidth = 2;
-                ctx.setLineDash([10, 10]);
-                ctx.beginPath();
-                ctx.moveTo(50, yPos);
-                ctx.lineTo(canvas.width - 50, yPos);
-                ctx.stroke();
-                ctx.setLineDash([]);
-            }
-        }
-
-        async function updateDashboard() {
-            try {
-                const res = await fetch('/api/vehicles');
-                const data = await res.json();
-                drawRoads();
-                const listDiv = document.getElementById('vehicles-list');
-                listDiv.innerHTML = '';
-
-                const now = Date.now();
-
-                const vehiclesArray = Object.values(data).filter(veh => {
-                    return (now - veh.timestamp) <= 15000;
-                });
-
-                if (vehiclesArray.length === 0) {
-                    listDiv.innerHTML = 'Esperando datos de la SQS.';
-                    return;
-                }
-
-                vehiclesArray.forEach((veh) => {
-                    let targetY = veh.y;
-                    let mappedX = veh.x;
-
-                    let hasAlert = veh.events && veh.events.some(e => e.type !== "normal telemetry");
-
-                    // Representación de los coches
-                    ctx.beginPath();
-                    ctx.arc(mappedX, targetY, 12, 0, 2 * Math.PI);
-                    ctx.fillStyle = hasAlert ? '#ff4444' : '#00ccff';
-                    ctx.fill();
-                    ctx.strokeStyle = '#ffffff';
-                    ctx.lineWidth = 2;
-                    ctx.stroke();
-
-                    ctx.fillStyle = '#ffffff';
-                    ctx.font = '11px Arial';
-                    ctx.fillText(veh.id, mappedX - 15, targetY - 16);
-
-                    if (hasAlert) {
-                        ctx.fillStyle = '#ffff00';
-                        ctx.font = '12px Arial';
-                        ctx.fillText('⚠️', mappedX - 5, targetY + 4);
-                    }
-
-                    let eventsHtml = "";
-                    let validEvents = veh.events ? veh.events.filter(e => (now - e.timestamp) < 15000) : [];
-                    
-                    if (validEvents.length === 0) {
-                        eventsHtml = "<li>Ninguna</li>";
-                    } else {
-                        validEvents.forEach(ev => {
-                            eventsHtml += `<li>${ev.type}</li>`;
-                        });
-                    }
-
-                    const card = document.createElement('div');
-                    card.className = `vehicle-card`;
-                    card.innerHTML = `
-                        <strong><span class="status-dot ${hasAlert ? 'danger' : 'normal'}"></span>${veh.id}</strong><br>
-                        Carril: ${veh.lane} | Vel: ${veh.speed} km/h<br>
-                        Pos: (${Math.round(veh.x)}, ${Math.round(veh.y)})<br>
-                        <hr style="border: 0; border-top: 1px solid #444; margin: 5px 0;">
-                        <small><strong>Eventos actuales:</strong></small>
-                        <ul class="events-list">
-                            ${eventsHtml}
-                        </ul>
-                        <small style="color: #888;">Hora: ${veh.last_update}</small>
-                    `;
-                    listDiv.appendChild(card);
-                });
-            } catch (err) { console.error("Error:", err); }
-        }
-        async function updateAlerts() {
-            try {
-                const res = await fetch('/api/alerts');
-                const alerts = await res.json();
-                const box = document.getElementById('alerts-list');
-                box.textContent = alerts.length ? '' : 'Sin alertas';
-                alerts.slice(0, 8).forEach(a => {
-                    const row = document.createElement('div');
-                    row.className = 'alert-row';
-                    row.textContent = `${a.alert_time} | ${a.alert_type} | ${a.location} | ${a.message}`;
-                    box.appendChild(row);
-                });
-            } catch (err) { console.error("Error:", err); }
-        }
-        setInterval(updateDashboard, 1000);
-        setInterval(updateAlerts, 1000);
-    </script>
-</body>
-</html>
-"""
-
-
 def create_app(service):
     app = Flask(__name__)
 
     @app.route("/")
     def index():
-        return render_template_string(HTML_TEMPLATE)
+        # templates/dashboard.html: HTML, CSS y JavaScript del dashboard en un solo fichero.
+        return render_template("dashboard.html")
 
     @app.route("/api/vehicles")
     def get_vehicles():
