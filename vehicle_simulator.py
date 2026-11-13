@@ -464,7 +464,8 @@ def run_experiment_once(args, targets, run_id):
         return int(attrs["ApproximateNumberOfMessages"]), int(attrs["ApproximateNumberOfMessagesNotVisible"])
 
     rsus = list(targets["rsu_http"].items())
-    counters = {name: CumulativeCounter() for name in ("duplicates", "redelivered", "out_of_order", "errors")}
+    counters = {name: CumulativeCounter() for name in (
+        "duplicates", "redelivered", "out_of_order", "out_of_order_same_rsu", "out_of_order_cross_rsu", "errors")}
     rsu_totals = {f"{rsu}:{name}": CumulativeCounter() for rsu, _ in rsus
                   for name in ("forwarded", "retries", "dropped_buffer")}
     peaks = {"buffered": 0, "queue": 0}
@@ -518,6 +519,8 @@ def run_experiment_once(args, targets, run_id):
     else:
         targets["service_control"]("start")
     restored_at = round(time.monotonic() - marks["start"], 1)
+    # Referencia para contar solo el desorden posterior a la restauración (precisión de ±1 s de muestreo).
+    at_restore = {name: counters[name].total for name in ("out_of_order_same_rsu", "out_of_order_cross_rsu")}
     print(f"[{run_id}] restaurado; tráfico durante {args.cooldown} s más")
     time.sleep(args.cooldown)
     fleet.stop()
@@ -556,6 +559,12 @@ def run_experiment_once(args, targets, run_id):
         "cloud_duplicates": counters["duplicates"].total,
         "cloud_redelivered": counters["redelivered"].total,
         "cloud_out_of_order": counters["out_of_order"].total,
+        "cloud_out_of_order_same_rsu": counters["out_of_order_same_rsu"].total,
+        "cloud_out_of_order_cross_rsu": counters["out_of_order_cross_rsu"].total,
+        "out_of_order_same_rsu_after_restore":
+            counters["out_of_order_same_rsu"].total - at_restore["out_of_order_same_rsu"],
+        "out_of_order_cross_rsu_after_restore":
+            counters["out_of_order_cross_rsu"].total - at_restore["out_of_order_cross_rsu"],
         "cloud_errors": counters["errors"].total,
         "dlq_depth": sum(queue_depth(dlq_url)),
         "recovery_s": round(recovery, 1) if recovery != "" else "",

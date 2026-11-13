@@ -90,7 +90,7 @@ class V2XService:
         self.latencies = deque(maxlen=2000)
         self.metrics = {k: 0 for k in (
             "accepted", "processed", "duplicates", "redelivered", "out_of_order",
-            "alerts_published", "errors")}
+            "out_of_order_same_rsu", "out_of_order_cross_rsu", "alerts_published", "errors")}
 
     def _count(self, name):
         with self.lock:
@@ -151,6 +151,7 @@ class V2XService:
             if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
                 raise
             self._count("out_of_order")
+            self._classify_out_of_order(event)
 
         with self.lock:
             current = self.vehicles.get(event["source_id"])
@@ -169,6 +170,21 @@ class V2XService:
                 "event_time": event["event_time"],
                 "last_update": time.strftime("%H:%M:%S"),
             }
+
+    def _classify_out_of_order(self, event):
+        """Distingue si el evento lo adelantó otro más reciente llegado por la misma RSU o por otra.
+
+        Con el buffer FIFO de la RSU, el desorden dentro de una misma RSU solo lo introduce SQS
+        estándar; el desorden entre RSU lo provocan los cambios de RSU de los vehículos.
+        """
+        item = self.table.get_item(Key={"pk": f"vehicle#{event['source_id']}"},
+                                   ConsistentRead=True).get("Item", {})
+        try:
+            newer_rsu = json.loads(item.get("vehicle_state", "{}")).get("rsu_id")
+        except ValueError:
+            newer_rsu = None
+        same = newer_rsu == event.get("rsu_id")
+        self._count("out_of_order_same_rsu" if same else "out_of_order_cross_rsu")
 
     def _record_latency(self, event):
         if "rsu_time" in event:

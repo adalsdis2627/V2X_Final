@@ -40,7 +40,7 @@ class FakeTable:
             raise conditional_failure()
         self.items[Item["pk"]] = Item
 
-    def get_item(self, Key):
+    def get_item(self, Key, ConsistentRead=False):
         item = self.items.get(Key["pk"])
         return {"Item": item} if item else {}
 
@@ -49,7 +49,8 @@ class FakeTable:
         event_time = ExpressionAttributeValues[":t"]
         if current and current["event_time"] >= event_time:
             raise conditional_failure()
-        self.items[Key["pk"]] = {**Key, "event_time": event_time}
+        self.items[Key["pk"]] = {**Key, "event_time": event_time,
+                                 "vehicle_state": ExpressionAttributeValues[":s"]}
 
 
 class Clock:
@@ -255,6 +256,40 @@ def test_older_event_does_not_overwrite_vehicle_state(service):
     assert service.table.items["vehicle#veh-001"]["event_time"] == "2026-11-09T10:00:05.000Z"
     assert service.vehicles["veh-001"]["event_time"] == "2026-11-09T10:00:05.000Z"
     assert service.metrics["out_of_order"] == 1
+
+
+def via_rsu(rsu, second, event_id=None):
+    return json.dumps({**make_event(event_time=f"2026-11-09T10:00:{second:02d}.000Z", event_id=event_id),
+                       "rsu_id": rsu})
+
+
+def test_out_of_order_within_the_same_rsu_is_classified(service):
+    service.process_body(via_rsu("rsu-1", 2))
+    service.process_body(via_rsu("rsu-1", 1))
+    assert service.metrics["out_of_order_same_rsu"] == 1
+    assert service.metrics["out_of_order_cross_rsu"] == 0
+
+
+def test_out_of_order_after_rsu_change_is_classified_as_cross_rsu(service):
+    service.process_body(via_rsu("rsu-2", 2))  # Llega antes el evento nuevo, enviado por la RSU 2.
+    service.process_body(via_rsu("rsu-1", 1))  # El antiguo sale después del buffer de la RSU 1.
+    assert service.metrics["out_of_order_cross_rsu"] == 1
+    assert service.metrics["out_of_order_same_rsu"] == 0
+
+
+def test_duplicate_is_not_counted_as_out_of_order(service):
+    service.process_body(via_rsu("rsu-1", 1, event_id="e1"))
+    service.process_body(via_rsu("rsu-1", 2))
+    service.process_body(via_rsu("rsu-1", 1, event_id="e1"), receive_count=2)
+    assert service.metrics["duplicates"] == 1
+    assert service.metrics["out_of_order"] == 0
+
+
+def test_out_of_order_total_equals_same_plus_cross(service):
+    for rsu, second in [("rsu-1", 5), ("rsu-1", 3), ("rsu-2", 8), ("rsu-1", 6), ("rsu-2", 7), ("rsu-2", 9)]:
+        service.process_body(via_rsu(rsu, second))
+    m = service.metrics
+    assert (m["out_of_order"], m["out_of_order_same_rsu"], m["out_of_order_cross_rsu"]) == (3, 2, 1)
 
 
 def test_road_hazard_generates_one_alert_for_all_rsus(service):
