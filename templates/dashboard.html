@@ -28,13 +28,27 @@
         const canvas = document.getElementById('map');
         const ctx = canvas.getContext('2d');
 
+        // Carriles 1-2: RSU 1. Carriles 3-4: RSU 2.
+        const RSU_COLORS = { 'rsu-1': '#4da3ff', 'rsu-2': '#c77dff' };
+
         function drawRoads() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             const laneHeight = canvas.height / 5;
-            
+
+            [['rsu-1', 'RSU 1', 1], ['rsu-2', 'RSU 2', 3]].forEach(([rsu, label, firstLane]) => {
+                const top = firstLane * laneHeight - laneHeight / 2;
+                ctx.globalAlpha = 0.12;
+                ctx.fillStyle = RSU_COLORS[rsu];
+                ctx.fillRect(10, top, canvas.width - 20, 2 * laneHeight);
+                ctx.globalAlpha = 1;
+                ctx.fillStyle = RSU_COLORS[rsu];
+                ctx.font = 'bold 12px Arial';
+                ctx.fillText(label, 14, top + 14);
+            });
+
             for (let i = 1; i <= 4; i++) {
                 let yPos = i * laneHeight;
-                
+
                 ctx.strokeStyle = "#444455";
                 ctx.lineWidth = 25;
                 ctx.beginPath();
@@ -83,8 +97,9 @@
                     ctx.arc(mappedX, targetY, 12, 0, 2 * Math.PI);
                     ctx.fillStyle = hasAlert ? '#ff4444' : '#00ccff';
                     ctx.fill();
-                    ctx.strokeStyle = '#ffffff';
-                    ctx.lineWidth = 2;
+                    // El borde indica la RSU que atendió el último evento: cambia al pasar de tramo.
+                    ctx.strokeStyle = RSU_COLORS[veh.rsu] || '#ffffff';
+                    ctx.lineWidth = 3;
                     ctx.stroke();
 
                     ctx.fillStyle = '#ffffff';
@@ -112,6 +127,7 @@
                     card.className = `vehicle-card`;
                     card.innerHTML = `
                         <strong><span class="status-dot ${hasAlert ? 'danger' : 'normal'}"></span>${veh.id}</strong><br>
+                        RSU: <span style="color: ${RSU_COLORS[veh.rsu] || '#ffffff'}">${veh.rsu}</span><br>
                         Carril: ${veh.lane} | Vel: ${veh.speed} km/h<br>
                         Pos: (${Math.round(veh.x)}, ${Math.round(veh.y)})<br>
                         <hr style="border: 0; border-top: 1px solid #444; margin: 5px 0;">
