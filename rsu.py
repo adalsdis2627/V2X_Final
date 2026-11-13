@@ -62,7 +62,8 @@ class SeenIds:
 
 class Rsu:
     def __init__(self, rsu_id, send_to_cloud, publish_mqtt, confirm_subscription=None, topic_arn=None,
-                 telemetry_period=3.0, buffer_size=5000, clock=time.monotonic):
+                 telemetry_period=3.0, buffer_size=5000, congestion_threshold=2, congestion_window_s=30.0,
+                 clock=time.monotonic):
         self.rsu_id = rsu_id
         self.send_to_cloud = send_to_cloud
         self.publish_mqtt = publish_mqtt
@@ -70,7 +71,11 @@ class Rsu:
         self.topic_arn = topic_arn
         self.telemetry_period = telemetry_period
         self.buffer_size = buffer_size
+        self.congestion_threshold = congestion_threshold
+        self.congestion_window_s = congestion_window_s
         self.clock = clock
+        self.congestion_reports = deque()  # (instante de llegada, source_id), ventana deslizante
+        self.last_congestion_alert = None
         self.lock = threading.Lock()
         self.buffer = deque()
         self.seen_events = SeenIds()
@@ -80,7 +85,7 @@ class Rsu:
         self.backoff = 1
         self.metrics = {k: 0 for k in (
             "received", "rejected", "duplicates", "filtered", "forwarded", "dropped_buffer",
-            "retries", "local_alerts", "cloud_alerts_relayed", "cloud_alerts_ignored",
+            "retries", "local_alerts", "local_congestion_alerts", "cloud_alerts_relayed", "cloud_alerts_ignored",
             "cloud_alerts_duplicates")}
 
     @property
@@ -116,10 +121,35 @@ class Rsu:
             event["rsu_id"] = self.rsu_id
             event["rsu_time"] = utc_now()
             self._enqueue(event)
+            congested = self._check_local_congestion(event) if event["event_type"] == "congestion" else 0
 
         if event["event_type"] == "sudden braking":
-            self._send_local_alert(event)
+            self._send_local_alert(event, f"local-{event['event_id']}", "sudden braking ahead", "high",
+                                   f"{event['source_id']} ha frenado bruscamente")
+        if congested:
+            self._send_local_alert(event, f"local-congestion-{event['event_id']}", "congestion", "medium",
+                                   f"{congested} vehículos en congestión en el tramo de {self.rsu_id}")
+            with self.lock:
+                self.metrics["local_congestion_alerts"] += 1
         return "accepted"
+
+    def _check_local_congestion(self, event):
+        """Ventana deslizante sobre los últimos congestion_window_s segundos de este tramo.
+
+        Devuelve el número de vehículos distintos si hay que alertar, o 0. Mientras la congestión
+        persista, se vuelve a alertar como mucho una vez por ventana. Se llama con el lock tomado.
+        """
+        now = self.clock()
+        self.congestion_reports.append((now, event["source_id"]))
+        while now - self.congestion_reports[0][0] > self.congestion_window_s:
+            self.congestion_reports.popleft()
+        vehicles = {source for _, source in self.congestion_reports}
+        if len(vehicles) < self.congestion_threshold:
+            return 0
+        if self.last_congestion_alert is not None and now - self.last_congestion_alert < self.congestion_window_s:
+            return 0
+        self.last_congestion_alert = now
+        return len(vehicles)
 
     def _enqueue(self, event):
         """Mantiene el orden FIFO. Si el buffer está lleno sacrifica primero telemetría normal."""
@@ -135,18 +165,18 @@ class Rsu:
             self.metrics["dropped_buffer"] += 1
         self.buffer.append(event)
 
-    def _send_local_alert(self, event):
+    def _send_local_alert(self, event, alert_id, alert_type, severity, message):
         alert = {
-            "alert_id": f"local-{event['event_id']}",
-            "alert_type": "sudden braking ahead",
-            "severity": "high",
+            "alert_id": alert_id,
+            "alert_type": alert_type,
+            "severity": severity,
             "origin": self.rsu_id,
             "scope": self.rsu_id,
             "location": event["location"],
             "alert_time": utc_now(),
             "trigger_event_id": event["event_id"],
             "trigger_event_time": event["event_time"],
-            "message": f"{event['source_id']} ha frenado bruscamente",
+            "message": message,
         }
         self.publish_mqtt(self.alerts_topic, json.dumps(alert))
         with self.lock:
@@ -279,6 +309,8 @@ def main():
         topic_arn=topic_arn,
         telemetry_period=float(os.environ.get("TELEMETRY_PERIOD_S", "3")),
         buffer_size=int(os.environ.get("BUFFER_SIZE", "5000")),
+        congestion_threshold=int(os.environ.get("LOCAL_CONGESTION_THRESHOLD", "2")),
+        congestion_window_s=float(os.environ.get("LOCAL_CONGESTION_WINDOW_S", "30")),
     )
 
     def on_connect(mqtt_client, _userdata, _flags, _reason, _properties):

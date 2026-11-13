@@ -47,10 +47,14 @@ def build_alert(alert_type, event, key, severity, message):
 
 
 class AlertEngine:
-    def __init__(self, congestion_threshold=3, window_s=30):
+    """Reglas de la nube. La congestión de un solo tramo la detecta su RSU; aquí solo se alerta
+    cuando la congestión abarca vehículos de al menos min_rsus RSU distintas."""
+
+    def __init__(self, congestion_threshold=3, window_s=30, min_rsus=2):
         self.threshold = congestion_threshold
         self.window_s = window_s
-        self.windows = defaultdict(set)
+        self.min_rsus = min_rsus
+        self.windows = defaultdict(set)  # (location, ventana) -> {(source_id, rsu_id)}
         self.fired = set()
 
     def evaluate(self, event):
@@ -62,15 +66,17 @@ class AlertEngine:
 
         bucket = int(parse_time(event["event_time"]).timestamp() // self.window_s)
         key = (event["location"], bucket)
-        self.windows[key].add(event["source_id"])
+        self.windows[key].add((event["source_id"], event.get("rsu_id")))
         for old in [k for k in self.windows if k[1] < bucket - 2]:
             del self.windows[old]
             self.fired.discard(old)
-        if len(self.windows[key]) < self.threshold or key in self.fired:
+        vehicles = {source for source, _ in self.windows[key]}
+        rsus = {rsu for _, rsu in self.windows[key] if rsu}
+        if len(vehicles) < self.threshold or len(rsus) < self.min_rsus or key in self.fired:
             return []
         self.fired.add(key)
         return [build_alert("congestion", event, bucket, "medium",
-                            f"{len(self.windows[key])} vehículos en congestión en {event['location']}")]
+                            f"{len(vehicles)} vehículos en congestión entre {', '.join(sorted(rsus))}")]
 
 
 class V2XService:

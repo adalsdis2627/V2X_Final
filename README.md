@@ -5,8 +5,10 @@ Los vehículos simulados publican eventos por MQTT en su RSU. Cada RSU filtra lo
 | Fichero | Contenido |
 |---|---|
 | `vehicle_simulator.py` | Simulador de vehículos, inyección de anomalías y experimentos (se ejecuta en el portátil) |
+| `vehicle_simulator_single.py` | Versión simplificada: un solo vehículo por terminal, pensado para AWS |
 | `rsu.py` | RSU: broker MQTT, validación, filtrado, buffer, alertas locales y endpoint HTTP para SNS |
-| `v2x_service.py` | Servicio cloud: SQS, DynamoDB, reglas de alerta, SNS y dashboard |
+| `v2x_service.py` | Servicio cloud: SQS, DynamoDB, reglas de alerta, SNS y API del dashboard |
+| `templates/dashboard.html` | Página del dashboard (HTML, CSS y JavaScript en un solo fichero) |
 | `Dockerfile` | Dos imágenes desde un mismo fichero: `--target rsu` y `--target service` |
 | `test_v2x.py` | Pruebas unitarias (pytest) |
 | `.github/workflows/deploy.yml` | Pipeline de pruebas, imágenes, infraestructura y despliegue |
@@ -47,7 +49,7 @@ Prepara Python 3.10, instala `requirements.txt` y ejecuta `pytest test_v2x.py`.
 | Falla alguna prueba | Un cambio ha roto la lógica. Reprodúcelo en local con `pytest test_v2x.py` |
 | Falla `pip install` | Versión fijada en `requirements.txt` inexistente o caída temporal de PyPI. Relanza o corrige la versión |
 
-**Qué comprueba `test_v2x.py`.** Son 36 pruebas unitarias que se ejecutan en segundos y sin AWS, MQTT ni Docker. DynamoDB, SQS, SNS y el broker se sustituyen por objetos en memoria, así que verifican la lógica del código, no la integración con los servicios reales.
+**Qué comprueba `test_v2x.py`.** Son 49 pruebas unitarias que se ejecutan en segundos y sin AWS, MQTT ni Docker. DynamoDB, SQS, SNS y el broker se sustituyen por objetos en memoria, así que verifican la lógica del código, no la integración con los servicios reales.
 
 | Bloque | Qué se verifica |
 |---|---|
@@ -56,9 +58,11 @@ Prepara Python 3.10, instala `requirements.txt` y ejecuta `pytest test_v2x.py`.
 | Buffer y reenvío | Con el enlace cortado los eventos se acumulan y salen en el mismo orden al restaurarlo. Un fallo de envío se reintenta con backoff, y si el buffer se llena se descarta primero la telemetría normal |
 | SNS por HTTP | Confirmación de la suscripción con el `Token`, lectura de notificaciones con `Content-Type: text/plain`, alertas duplicadas retransmitidas una sola vez, alertas para otra RSU ignoradas, topic ajeno rechazado (403) y respuesta 503 con el enlace cortado para que SNS reintente |
 | V2X-SERVICE | Un mismo evento recibido dos veces se guarda una sola vez y cuenta como duplicado. Un mensaje malformado lanza error para que acabe en la DLQ. Un evento antiguo no sobrescribe el estado del vehículo |
-| Reglas de alerta | `road hazard` genera una única alerta dirigida a ambas RSU. La congestión requiere 3 vehículos distintos en la misma ventana de 30 s y se dispara una vez. El `alert_id` es determinista, y una alerta que falló al publicarse se recupera cuando SQS reentrega el evento |
+| Reglas de alerta | `road hazard` genera una única alerta dirigida a ambas RSU. La congestión en la nube requiere 3 vehículos distintos de al menos 2 RSU en la misma ventana de 30 s, y se dispara una vez; si solo afecta a una RSU, la nube no alerta. El `alert_id` es determinista, y una alerta que falló al publicarse se recupera cuando SQS reentrega el evento |
+| Congestión local en la RSU | Con 2 vehículos distintos en los últimos 30 s (ventana deslizante), la RSU alerta a su tramo. Los avisos repetidos de un mismo vehículo no cuentan, los antiguos salen de la ventana, se vuelve a alertar como mucho una vez cada 30 s y los eventos se siguen reenviando a la nube |
 | API del servicio | `/`, `/api/vehicles`, `/api/alerts` y `/api/metrics` responden con los datos esperados |
-| Simulador | Reparto de vehículos entre RSU, eventos compatibles con la validación de la RSU y con `event_id` único, inyección de pérdida, duplicación y desorden, y contadores que se mantienen aunque el servicio se reinicie |
+| Simulador | Cada mitad del circuito corresponde a una RSU, eventos compatibles con la validación de la RSU y con `event_id` único, inyección de pérdida, duplicación y desorden, y contadores que se mantienen aunque el servicio se reinicie |
+| Cambio de RSU | El vehículo arranca en la RSU de su carril y solo cambia al pasar de una mitad a la otra (también al cerrar el circuito, del carril 4 al 1). Se conecta a la RSU nueva antes de cerrar la antigua, un evento retenido sale por la RSU a la que iba dirigido, un cambio fallido se reintenta en el siguiente evento y una alerta oída por las dos RSU se registra una sola vez |
 
 El funcionamiento del sistema completo no lo cubren estas pruebas. Se comprueba con la prueba en local de la sección 3 y en AWS.
 
@@ -141,7 +145,9 @@ pip install -r requirements.txt
 python vehicle_simulator.py --duration 120
 ```
 
-Encuentra las RSU solo, por las etiquetas de las instancias. Por defecto simula 5 vehículos: 1 a 3 en `rsu-1` y 4 y 5 en `rsu-2`. Muestra las alertas recibidas con su latencia y las guarda en `results/<run_id>_alerts.csv`.
+Encuentra las RSU solo, por las etiquetas de las instancias. Por defecto simula 5 vehículos, cada uno en un carril aleatorio. Muestra las alertas recibidas con su latencia y las guarda en `results/<run_id>_alerts.csv`.
+
+**Reparto entre RSU.** Los vehículos recorren el circuito de 4 carriles del dashboard: la RSU 1 cubre los carriles 1 y 2, y la RSU 2 los carriles 3 y 4. Cada vehículo se conecta a la RSU de su carril y cambia de RSU al pasar a la otra mitad (del carril 2 al 3 y del 4 al 1). El cambio es *make-before-break*: se conecta y suscribe a la RSU nueva, y solo después deja de usar la antigua, que cierra 1,5 s más tarde para que salgan los últimos mensajes. Así no se pierden eventos. Si la RSU nueva no responde, el vehículo sigue con la antigua y lo reintenta en el siguiente evento. Cada cambio se muestra en la consola con su duración (`<> [veh-003] cambio de rsu-1 a rsu-2 (16 ms)`). El número de vehículos de cada RSU varía con el tiempo, y en el dashboard cada mitad del circuito y el borde de cada coche llevan el color de su RSU.
 
 | Opción | Uso |
 |---|---|
@@ -150,13 +156,22 @@ Encuentra las RSU solo, por las etiquetas de las instancias. Por defecto simula 
 | `--burst`, `--burst-period` | Eventos extra por ráfaga y segundos entre ráfagas |
 | `--local` | Usa los contenedores locales y LocalStack en lugar de AWS |
 
+**Un vehículo por terminal.** `vehicle_simulator_single.py` crea un único coche y muestra en la terminal sus eventos y las alertas que recibe. Abre una terminal por cada coche:
+
+```bash
+python vehicle_simulator_single.py --id 1 --rsu 1
+python vehicle_simulator_single.py --id 4 --rsu 2 --rate 1
+```
+
+`--id 7` equivale a `veh-007`. `--rsu` (`1`, `2`, `rsu-1` o `rsu-2`) indica en qué mitad del circuito empieza el coche. Después cambia de RSU solo, igual que en el simulador completo, así que necesita la dirección de las dos. Las localiza por la etiqueta de sus instancias EC2. Con `--host-rsu1` y `--host-rsu2` (`host` o `host:puerto`) se le indican directamente, sin necesitar credenciales de AWS en el equipo. Otras opciones: `--rate`, `--critical-rate`, `--duration` y `--run-id`. No inyecta anomalías, no ejecuta experimentos ni genera CSV.
+
 **CSV generados.** Se guardan en `results/`, dentro de la carpeta desde la que se lanza el simulador. Cada ejecución tiene un `run_id`, que se puede fijar con `--run-id` y que también se guarda en DynamoDB con cada evento.
 
 | Fichero | Cuándo se crea | Contenido |
 |---|---|---|
 | `<run_id>_alerts.csv` | En toda ejecución | Una fila por alerta recibida por cada vehículo: vehículo, `alert_id`, tipo, origen (`rsu-1`, `rsu-2` o `cloud`) y latencia en ms desde el evento que la provocó. Ambos instantes los toma el reloj del portátil, así que no hay desfase entre máquinas |
 | `<run_id>_timeline.csv` | Solo en experimentos, uno por repetición | Una muestra por segundo: mensajes en la cola SQS, eventos en el buffer de cada RSU, si el servicio responde y cuántos eventos lleva procesados, y el total pendiente (`backlog`). Sirve para las gráficas de acumulación y vaciado |
-| `<run_id>_summary.csv` | Solo en experimentos, al terminar todas las repeticiones | Una fila por repetición: eventos generados, reenviados por las RSU y guardados en DynamoDB, pérdidas, picos de buffer y de cola, reintentos, duplicados, reentregas, eventos desordenados, mensajes en la DLQ, tiempo de recuperación, coherencia del estado final y p95 de latencia de las alertas locales y de la nube |
+| `<run_id>_summary.csv` | Solo en experimentos, al terminar todas las repeticiones | Una fila por repetición: eventos generados, reenviados por las RSU y guardados en DynamoDB, pérdidas, picos de buffer y de cola, reintentos, duplicados, reentregas, eventos desordenados, mensajes en la DLQ, tiempo de recuperación, coherencia del estado final, p95 de latencia de las alertas locales y de la nube, y cambios de RSU (realizados, fallidos y p95 de su duración) |
 
 Las pérdidas se calculan como eventos reenviados por las RSU menos eventos distintos guardados en DynamoDB. Así, la telemetría que la RSU filtra a propósito no cuenta como perdida.
 
@@ -166,7 +181,7 @@ python vehicle_simulator.py --experiment disconnect --repeat 3
 python vehicle_simulator.py --experiment failure --repeat 3 --ssh-key labsuser.pem
 ```
 
-- **`disconnect`:** corta el enlace de `rsu-1` con AWS durante 60 s.
+- **`disconnect`:** corta el enlace de `rsu-1` con AWS durante 60 s. Los vehículos que pasan a la RSU 2 durante el corte dejan eventos en el buffer de la RSU 1, que llegan a la nube después que los más recientes enviados por la RSU 2. Aparecen como `cloud_out_of_order`, pero el estado final es correcto (`final_state_ok`).
 - **`failure`:** detiene `v2x-service` durante 60 s por SSH.
 
 Los tiempos se ajustan con `--warmup`, `--outage` y `--cooldown`. Los CSV que generan se describen en el apartado anterior.

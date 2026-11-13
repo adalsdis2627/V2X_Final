@@ -1,6 +1,9 @@
 import json
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
@@ -281,30 +284,92 @@ def test_alert_lost_before_publish_is_recovered_on_redelivery():
     assert len(published) == 1
 
 
-def congestion(source, second=0):
-    return make_event("congestion", source, f"2026-11-09T10:00:{second:02d}.000Z")
+def congestion(source, second=0, rsu="rsu-1"):
+    return {**make_event("congestion", source, f"2026-11-09T10:00:{second:02d}.000Z"), "rsu_id": rsu}
 
 
-def test_congestion_needs_three_distinct_vehicles_and_fires_once():
+def test_cloud_congestion_needs_three_vehicles_from_two_rsus_and_fires_once():
     engine = AlertEngine()
     assert engine.evaluate(congestion("veh-001")) == []
     assert engine.evaluate(congestion("veh-001", 1)) == []
     assert engine.evaluate(congestion("veh-002", 2)) == []
-    assert len(engine.evaluate(congestion("veh-003", 3))) == 1
-    assert engine.evaluate(congestion("veh-004", 4)) == []
+    alerts = engine.evaluate(congestion("veh-004", 3, rsu="rsu-2"))
+    assert len(alerts) == 1
+    assert alerts[0]["scope"] == "all"
+    assert "rsu-1, rsu-2" in alerts[0]["message"]
+    assert engine.evaluate(congestion("veh-005", 4, rsu="rsu-2")) == []
+
+
+def test_cloud_ignores_congestion_confined_to_one_rsu():
+    engine = AlertEngine()
+    for second, source in enumerate(["veh-001", "veh-002", "veh-003"]):
+        assert engine.evaluate(congestion(source, second)) == []
 
 
 def test_congestion_alert_id_is_deterministic():
-    first, second = AlertEngine(congestion_threshold=1), AlertEngine(congestion_threshold=1)
+    first = AlertEngine(congestion_threshold=1, min_rsus=1)
+    second = AlertEngine(congestion_threshold=1, min_rsus=1)
     assert first.evaluate(congestion("veh-001"))[0]["alert_id"] == \
         second.evaluate(congestion("veh-002", 5))[0]["alert_id"]
 
 
 def test_congestion_in_different_windows_does_not_accumulate():
     engine = AlertEngine()
-    assert engine.evaluate(make_event("congestion", "veh-001", "2026-11-09T10:00:00.000Z")) == []
-    assert engine.evaluate(make_event("congestion", "veh-002", "2026-11-09T10:00:31.000Z")) == []
-    assert engine.evaluate(make_event("congestion", "veh-003", "2026-11-09T10:01:01.000Z")) == []
+    for source, rsu, event_time in [("veh-001", "rsu-1", "10:00:00"), ("veh-004", "rsu-2", "10:00:31"),
+                                    ("veh-002", "rsu-1", "10:01:01")]:
+        event = {**make_event("congestion", source, f"2026-11-09T{event_time}.000Z"), "rsu_id": rsu}
+        assert engine.evaluate(event) == []
+
+
+# --- Congestión local en la RSU (ventana deslizante) -------------------------
+
+def local_congestion_alerts(harness):
+    return [alert for _, alert in harness.published if alert["alert_type"] == "congestion"]
+
+
+def test_rsu_alerts_congestion_in_its_segment_with_two_vehicles(harness):
+    harness.rsu.handle_event(json.dumps(make_event("congestion", "veh-001")))
+    assert local_congestion_alerts(harness) == []
+    harness.clock.now = 10
+    harness.rsu.handle_event(json.dumps(make_event("congestion", "veh-002")))
+    alerts = local_congestion_alerts(harness)
+    assert len(alerts) == 1
+    assert alerts[0]["origin"] == "rsu-1"
+    assert alerts[0]["scope"] == "rsu-1"
+    assert harness.rsu.snapshot()["local_congestion_alerts"] == 1
+
+
+def test_rsu_congestion_ignores_repeated_reports_from_one_vehicle(harness):
+    for second in range(3):
+        harness.clock.now = second
+        harness.rsu.handle_event(json.dumps(make_event("congestion", "veh-001")))
+    assert local_congestion_alerts(harness) == []
+
+
+def test_rsu_congestion_window_slides(harness):
+    harness.rsu.handle_event(json.dumps(make_event("congestion", "veh-001")))
+    harness.clock.now = 31  # El primer aviso ya ha salido de la ventana de 30 s.
+    harness.rsu.handle_event(json.dumps(make_event("congestion", "veh-002")))
+    assert local_congestion_alerts(harness) == []
+    harness.clock.now = 40  # veh-002 (t=31) y veh-003 (t=40) caen dentro de la misma ventana.
+    harness.rsu.handle_event(json.dumps(make_event("congestion", "veh-003")))
+    assert len(local_congestion_alerts(harness)) == 1
+
+
+def test_rsu_congestion_realerts_at_most_once_per_window(harness):
+    for now, source in [(0, "veh-001"), (1, "veh-002"), (5, "veh-003"), (20, "veh-001")]:
+        harness.clock.now = now
+        harness.rsu.handle_event(json.dumps(make_event("congestion", source)))
+    assert len(local_congestion_alerts(harness)) == 1
+    harness.clock.now = 32  # Sigue habiendo congestión y ya ha pasado una ventana desde la alerta.
+    harness.rsu.handle_event(json.dumps(make_event("congestion", "veh-002")))
+    assert len(local_congestion_alerts(harness)) == 2
+
+
+def test_congestion_events_are_still_forwarded_to_the_cloud(harness):
+    for source in ("veh-001", "veh-002"):
+        harness.rsu.handle_event(json.dumps(make_event("congestion", source)))
+    assert harness.rsu.snapshot()["buffered"] == 2
 
 
 def test_percentile():
@@ -323,8 +388,8 @@ def test_api_endpoints(service):
 
 # --- Simulador ---------------------------------------------------------------
 
-def test_vehicles_are_split_between_rsus():
-    assert [vehicle_simulator.assign_rsu(n) for n in range(1, 6)] == ["rsu-1"] * 3 + ["rsu-2"] * 2
+def test_each_rsu_covers_half_of_the_circuit():
+    assert [vehicle_simulator.rsu_for_lane(lane) for lane in range(4)] == ["rsu-1", "rsu-1", "rsu-2", "rsu-2"]
 
 
 def test_simulated_event_is_accepted_by_rsu_schema():
@@ -337,38 +402,148 @@ def test_simulated_event_is_accepted_by_rsu_schema():
     assert abs(datetime.now(timezone.utc) - parsed) < timedelta(seconds=5)
 
 
-class Args:
-    delay_ms = 0
-    loss = 0
-    duplicate = 0
-    reorder = 0
+def simulator_args(**options):
+    defaults = dict(rate=1.5, critical_rate=0, delay_ms=0, loss=0, duplicate=0, reorder=0, burst=0, burst_period=10)
+    return SimpleNamespace(**{**defaults, **options})
 
 
 def injector_with(**options):
-    args = Args()
-    for name, value in options.items():
-        setattr(args, name, value)
     output = []
-    return vehicle_simulator.Injector(lambda t, b: output.append(b), args, vehicle_simulator.Recorder()), output
+    injector = vehicle_simulator.Injector(simulator_args(**options), vehicle_simulator.Recorder())
+    return injector, output, lambda topic, body: output.append(body)
 
 
 def test_injector_loss():
-    injector, output = injector_with(loss=1)
-    injector.send("t", "a")
+    injector, output, publish = injector_with(loss=1)
+    injector.send(publish, "t", "a")
     assert output == []
 
 
 def test_injector_duplicate():
-    injector, output = injector_with(duplicate=1)
-    injector.send("t", "a")
+    injector, output, publish = injector_with(duplicate=1)
+    injector.send(publish, "t", "a")
     assert output == ["a", "a"]
 
 
 def test_injector_reorder_swaps_consecutive_messages():
-    injector, output = injector_with(reorder=1)
-    injector.send("t", "a")
-    injector.send("t", "b")
+    injector, output, publish = injector_with(reorder=1)
+    injector.send(publish, "t", "a")
+    injector.send(publish, "t", "b")
     assert output == ["b", "a"]
+
+
+# --- Cambio de RSU (handover) ------------------------------------------------
+
+class FakeMqttClient:
+    def __init__(self, client_id):
+        self.client_id = client_id
+        self.published, self.subscriptions = [], []
+        self.endpoint, self.closed = None, False
+
+    def connect(self, host, port):
+        self.endpoint = (host, port)
+
+    def loop_start(self):
+        self.on_connect(self, None, None, 0, None)
+
+    def subscribe(self, topic, qos=0):
+        self.subscriptions.append(topic)
+
+    def publish(self, topic, body, qos=0):
+        self.published.append((topic, json.loads(body)))
+
+    def loop_stop(self):
+        pass
+
+    def disconnect(self):
+        self.closed = True
+
+
+ENDPOINTS = {"rsu-1": ("rsu1-host", 1883), "rsu-2": ("rsu2-host", 1883)}
+
+
+def vehicle_on_lane(lane, fail_rsu=None, **options):
+    clients = []
+
+    def factory(client_id):
+        if fail_rsu and fail_rsu in client_id:
+            raise ConnectionRefusedError("RSU caída")
+        clients.append(FakeMqttClient(client_id))
+        return clients[-1]
+
+    vehicle = vehicle_simulator.Vehicle("veh-001", ENDPOINTS, simulator_args(**options), "test",
+                                        vehicle_simulator.Recorder(), threading.Event(),
+                                        lane=lane, client_factory=factory)
+    vehicle.handover_grace_s = 0
+    return vehicle, clients
+
+
+def cross_to_next_lane(vehicle):
+    vehicle.state.update(x=640, speed=20)  # El siguiente paso supera x=650 y cambia de carril.
+    vehicle.step()
+
+
+def test_vehicle_starts_on_the_rsu_of_its_lane():
+    vehicle, clients = vehicle_on_lane(2)
+    assert vehicle.rsu_id == "rsu-2"
+    assert clients[0].endpoint == ENDPOINTS["rsu-2"]
+    assert clients[0].subscriptions == ["v2x/rsu-2/alerts"]
+
+
+def test_staying_in_the_same_half_does_not_change_rsu():
+    vehicle, clients = vehicle_on_lane(0)
+    cross_to_next_lane(vehicle)  # Carril 1 -> 2: sigue en la RSU 1.
+    assert vehicle.rsu_id == "rsu-1"
+    assert len(clients) == 1
+
+
+def test_handover_connects_to_new_rsu_before_closing_the_old_one():
+    vehicle, clients = vehicle_on_lane(1)
+    cross_to_next_lane(vehicle)  # Carril 2 -> 3: pasa a la RSU 2.
+    old, new = clients
+    assert vehicle.rsu_id == "rsu-2"
+    assert new.endpoint == ENDPOINTS["rsu-2"] and new.subscriptions == ["v2x/rsu-2/alerts"]
+    assert [topic for topic, _ in new.published] == ["v2x/rsu-2/events/veh-001"]
+    assert new.published[0][1]["payload"]["lane"] == 3
+    assert old.published == []
+    time.sleep(0.05)  # Periodo de gracia (0 s en la prueba) antes de cerrar la conexión antigua.
+    assert old.closed and not new.closed
+    assert vehicle.recorder.counters["handovers"] == 1
+
+
+def test_circuit_wraps_back_to_the_first_rsu():
+    vehicle, clients = vehicle_on_lane(3)
+    cross_to_next_lane(vehicle)  # Carril 4 -> 1.
+    assert vehicle.rsu_id == "rsu-1"
+    assert clients[-1].endpoint == ENDPOINTS["rsu-1"]
+
+
+def test_held_message_leaves_through_the_old_rsu_on_handover():
+    vehicle, clients = vehicle_on_lane(1, reorder=1)
+    vehicle.step()  # Evento retenido por la inyección de desorden.
+    assert clients[0].published == []
+    cross_to_next_lane(vehicle)
+    assert [topic for topic, _ in clients[0].published] == ["v2x/rsu-1/events/veh-001"]
+
+
+def test_failed_handover_keeps_old_rsu_and_retries():
+    vehicle, clients = vehicle_on_lane(1, fail_rsu="rsu-2")
+    cross_to_next_lane(vehicle)
+    assert vehicle.rsu_id == "rsu-1"
+    assert [topic for topic, _ in clients[0].published] == ["v2x/rsu-1/events/veh-001"]
+    assert vehicle.recorder.counters["handover_failures"] == 1
+    vehicle.client_factory = lambda client_id: clients.append(FakeMqttClient(client_id)) or clients[-1]
+    vehicle.step()  # Siguiente evento: vuelve a intentarlo y ahora lo consigue.
+    assert vehicle.rsu_id == "rsu-2"
+
+
+def test_vehicle_ignores_repeated_alert_heard_from_both_rsus():
+    vehicle, _ = vehicle_on_lane(0)
+    alert = json.dumps({"alert_id": "a1", "alert_type": "road hazard", "origin": "cloud",
+                        "trigger_event_time": "2026-11-09T10:00:00.000Z"})
+    vehicle._on_alert(alert)
+    vehicle._on_alert(alert)
+    assert len(vehicle.recorder.alerts) == 1
 
 
 def test_cumulative_counter_survives_restart():
