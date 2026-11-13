@@ -1,5 +1,8 @@
 """Simulador de vehículos (OBU) por MQTT, inyección de anomalías y experimentos controlados.
 
+Los vehículos recorren un circuito de 4 carriles: la RSU 1 cubre los carriles 1-2 y la RSU 2
+los carriles 3-4. Al pasar de una mitad a la otra, cada vehículo cambia de RSU.
+
 Ejemplos:
   python vehicle_simulator.py --local
   python vehicle_simulator.py --vehicles 5 --rate 1 --loss 0.1 --duration 120
@@ -28,6 +31,8 @@ TABLE_NAME = "v2x"
 LOCALSTACK_URL = "http://localhost:4566"
 RESULTS_DIR = Path("results")
 LANE_Y_POSITIONS = [80, 160, 240, 320]
+CONNECT_TIMEOUT_S = 5
+HANDOVER_GRACE_S = 1.5  # Tiempo que se mantiene la conexión antigua tras un cambio de RSU.
 CRITICAL_EVENTS = [("sudden braking", 0.35), ("congestion", 0.45), ("road hazard", 0.20)]
 SPEED_RANGES = {
     "normal telemetry": (40, 90),
@@ -41,9 +46,14 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def assign_rsu(vehicle_number):
-    """Vehículos 1-3 a la RSU 1 y 4-5 a la RSU 2, repitiendo el patrón si hay más."""
-    return "rsu-1" if (vehicle_number - 1) % 5 < 3 else "rsu-2"
+def rsu_for_lane(lane_index):
+    """Los carriles 1-2 (índices 0-1) los cubre la RSU 1 y los carriles 3-4 la RSU 2."""
+    return "rsu-1" if lane_index < 2 else "rsu-2"
+
+
+def p95(values):
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))] if ordered else ""
 
 
 def choose_event_type(critical_rate):
@@ -73,10 +83,13 @@ def make_event(vehicle_id, state, seq, run_id, event_type):
 
 
 class Injector:
-    """Aplica retardo, pérdida, duplicación y desorden antes de publicar."""
+    """Aplica retardo, pérdida, duplicación y desorden antes de publicar.
 
-    def __init__(self, publish, args, recorder):
-        self.publish = publish
+    Cada mensaje viaja con su propia función de publicación: así, un mensaje retrasado o
+    retenido sale por la RSU a la que iba dirigido aunque el vehículo haya cambiado de RSU.
+    """
+
+    def __init__(self, args, recorder):
         self.delay_s = args.delay_ms / 1000
         self.loss = args.loss
         self.duplicate = args.duplicate
@@ -85,16 +98,16 @@ class Injector:
         self.lock = threading.Lock()
         self.held = None
 
-    def _emit(self, topic, body):
+    def _emit(self, publish, topic, body):
         if self.delay_s:
-            timer = threading.Timer(self.delay_s, self.publish, (topic, body))
+            timer = threading.Timer(self.delay_s, publish, (topic, body))
             timer.daemon = True
             timer.start()
         else:
-            self.publish(topic, body)
+            publish(topic, body)
         self.recorder.count("published")
 
-    def send(self, topic, body):
+    def send(self, publish, topic, body):
         if random.random() < self.loss:
             self.recorder.count("injected_loss")
             return
@@ -104,22 +117,24 @@ class Injector:
             self.recorder.count("injected_duplicates")
         with self.lock:
             if self.held is None and random.random() < self.reorder:
-                self.held = (topic, body, copies)
+                self.held = (publish, topic, body, copies)
                 self.recorder.count("injected_reorders")
                 return
             held, self.held = self.held, None
         for _ in range(copies):
-            self._emit(topic, body)
-        if held:
-            for _ in range(held[2]):
-                self._emit(held[0], held[1])
+            self._emit(publish, topic, body)
+        self._release(held)
 
     def flush(self):
         with self.lock:
             held, self.held = self.held, None
+        self._release(held)
+
+    def _release(self, held):
         if held:
-            for _ in range(held[2]):
-                self._emit(held[0], held[1])
+            publish, topic, body, copies = held
+            for _ in range(copies):
+                self._emit(publish, topic, body)
 
 
 class Recorder:
@@ -127,6 +142,7 @@ class Recorder:
         self.lock = threading.Lock()
         self.counters = {}
         self.alerts = []
+        self.handover_ms = []
 
     def count(self, name):
         with self.lock:
@@ -142,9 +158,19 @@ class Recorder:
             self.alerts.append(row)
         print(f"  << [{vehicle_id}] ALERTA {alert['alert_type']} ({alert['origin']}) {latency_ms} ms")
 
+    def handover(self, vehicle_id, old_rsu, new_rsu, elapsed_ms):
+        with self.lock:
+            self.counters["handovers"] = self.counters.get("handovers", 0) + 1
+            self.handover_ms.append(round(elapsed_ms, 1))
+        print(f"  <> [{vehicle_id}] cambio de {old_rsu} a {new_rsu} ({elapsed_ms:.0f} ms)")
+
     def p95_latency(self, origin_cloud):
-        values = sorted(a["latency_ms"] for a in self.alerts if (a["origin"] == "cloud") == origin_cloud)
-        return values[min(len(values) - 1, int(0.95 * len(values)))] if values else ""
+        return p95([a["latency_ms"] for a in self.alerts if (a["origin"] == "cloud") == origin_cloud])
+
+    def summary(self):
+        return {**self.counters, "alerts_received": len(self.alerts),
+                "p95_local_alert_ms": self.p95_latency(False), "p95_cloud_alert_ms": self.p95_latency(True),
+                "p95_handover_ms": p95(self.handover_ms)}
 
     def write_alerts(self, run_id):
         RESULTS_DIR.mkdir(exist_ok=True)
@@ -154,29 +180,88 @@ class Recorder:
             writer.writerows(self.alerts)
 
 
+def new_mqtt_client(client_id):
+    return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+
+
 class Vehicle(threading.Thread):
-    def __init__(self, number, rsu_id, endpoint, args, run_id, recorder, stop_event):
+    """Vehículo que recorre el circuito y cambia de RSU al pasar de una mitad a la otra.
+
+    El cambio es "make-before-break": primero se conecta a la RSU nueva y solo después
+    cambia de cliente y cierra la conexión antigua, así que no se pierden eventos.
+    """
+
+    def __init__(self, vehicle_id, endpoints, args, run_id, recorder, stop_event,
+                 lane=None, verbose=False, client_factory=new_mqtt_client):
         super().__init__(daemon=True)
-        self.vehicle_id = f"veh-{number:03d}"
-        self.rsu_id = rsu_id
+        self.vehicle_id = vehicle_id
+        self.endpoints = endpoints
         self.args = args
         self.run_id = run_id
         self.recorder = recorder
         self.stop_event = stop_event
-        self.state = {"x": random.randint(50, 400), "lane": random.randint(0, 3), "speed": random.randint(15, 25)}
+        self.verbose = verbose
+        self.client_factory = client_factory
+        self.handover_grace_s = HANDOVER_GRACE_S
+        self.lock = threading.Lock()
+        self.seen_alerts = set()
+        lane = random.randint(0, 3) if lane is None else lane
+        self.state = {"x": random.randint(50, 400), "lane": lane, "speed": random.randint(15, 25)}
         self.seq = 0
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"{self.vehicle_id}-{run_id}")
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
-        self.client.connect(*endpoint)
-        self.client.loop_start()
-        self.injector = Injector(lambda t, b: self.client.publish(t, b, qos=1), args, recorder)
+        self.rsu_id = rsu_for_lane(lane)
+        self.client = self._connect(self.rsu_id)
+        self.injector = Injector(args, recorder)
 
-    def _on_connect(self, client, _userdata, _flags, _reason, _properties):
-        client.subscribe(f"v2x/{self.rsu_id}/alerts", qos=1)
+    def _connect(self, rsu_id):
+        """Conecta un cliente nuevo a la RSU y espera a que el broker acepte la conexión."""
+        # El sufijo aleatorio evita que dos clientes con el mismo identificador se expulsen del broker.
+        client = self.client_factory(f"{self.vehicle_id}-{rsu_id}-{uuid.uuid4().hex[:6]}")
+        ready = threading.Event()
 
-    def _on_message(self, _client, _userdata, message):
-        self.recorder.alert(self.vehicle_id, json.loads(message.payload))
+        def on_connect(mqtt_client, _userdata, _flags, reason_code, _properties):
+            if not getattr(reason_code, "is_failure", False):
+                mqtt_client.subscribe(f"v2x/{rsu_id}/alerts", qos=1)  # Se repite en cada reconexión.
+                ready.set()
+
+        client.on_connect = on_connect
+        client.on_message = lambda _client, _userdata, message: self._on_alert(message.payload)
+        client.connect(*self.endpoints[rsu_id])
+        client.loop_start()
+        if not ready.wait(CONNECT_TIMEOUT_S):
+            self._close(client)
+            raise ConnectionError(f"{rsu_id} no aceptó la conexión en {CONNECT_TIMEOUT_S} s")
+        return client
+
+    @staticmethod
+    def _close(client):
+        client.loop_stop()
+        client.disconnect()
+
+    def _on_alert(self, payload):
+        alert = json.loads(payload)
+        with self.lock:
+            # Durante un cambio se escucha a las dos RSU: la misma alerta puede llegar dos veces.
+            if alert["alert_id"] in self.seen_alerts:
+                return
+            self.seen_alerts.add(alert["alert_id"])
+        self.recorder.alert(self.vehicle_id, alert)
+
+    def _handover(self, new_rsu):
+        started = time.monotonic()
+        try:
+            new_client = self._connect(new_rsu)
+        except Exception as exc:
+            self.recorder.count("handover_failures")
+            print(f"[{self.vehicle_id}] no se pudo cambiar a {new_rsu}; se reintentará: {exc}")
+            return
+        self.injector.flush()  # Lo retenido por la inyección de desorden sale por la RSU antigua.
+        with self.lock:
+            old_client, old_rsu = self.client, self.rsu_id
+            self.client, self.rsu_id = new_client, new_rsu
+        self.recorder.handover(self.vehicle_id, old_rsu, new_rsu, (time.monotonic() - started) * 1000)
+        timer = threading.Timer(self.handover_grace_s, self._close, (old_client,))
+        timer.daemon = True
+        timer.start()
 
     def _advance(self):
         self.state["x"] += self.state["speed"]
@@ -189,35 +274,46 @@ class Vehicle(threading.Thread):
         self.seq += 1
         event_type = choose_event_type(self.args.critical_rate)
         event = make_event(self.vehicle_id, self.state, self.seq, self.run_id, event_type)
-        self.injector.send(f"v2x/{self.rsu_id}/events/{self.vehicle_id}", json.dumps(event))
+        client = self.client  # Fijado ahora: si el mensaje se retrasa, sale por esta RSU.
+        self.injector.send(lambda topic, body: client.publish(topic, body, qos=1),
+                           f"v2x/{self.rsu_id}/events/{self.vehicle_id}", json.dumps(event))
         self.recorder.count("generated")
-        if event_type != "normal telemetry":
+        if self.verbose:
+            payload = event["payload"]
+            print(f"[{self.vehicle_id} -> {self.rsu_id}] carril {payload['lane']} | x={payload['x']} | "
+                  f"{payload['speed']} km/h | {event_type}")
+        elif event_type != "normal telemetry":
             print(f"[{self.vehicle_id} -> {self.rsu_id}] {event_type}")
+
+    def step(self):
+        """Avanza, cambia de RSU si ha entrado en la otra mitad del circuito y emite un evento."""
+        self._advance()
+        wanted = rsu_for_lane(self.state["lane"])
+        if wanted != self.rsu_id:  # Si el cambio falla, se reintenta en el siguiente paso.
+            self._handover(wanted)
+        self._emit()
 
     def run(self):
         next_burst = time.monotonic() + self.args.burst_period
         while not self.stop_event.wait(self.args.rate):
-            self._advance()
-            self._emit()
+            self.step()
             if self.args.burst and time.monotonic() >= next_burst:
                 next_burst += self.args.burst_period
                 for _ in range(self.args.burst):
                     self._emit()
         self.injector.flush()
         time.sleep(1)  # Da tiempo a que salgan los últimos QoS 1.
-        self.client.loop_stop()
-        self.client.disconnect()
+        self._close(self.client)
 
 
 class Fleet:
     def __init__(self, args, targets, run_id):
         self.stop_event = threading.Event()
         self.recorder = Recorder()
-        self.vehicles = []
-        for number in range(1, args.vehicles + 1):
-            rsu_id = assign_rsu(number)
-            self.vehicles.append(Vehicle(number, rsu_id, targets["mqtt"][rsu_id], args, run_id,
-                                         self.recorder, self.stop_event))
+        self.vehicles = [
+            Vehicle(f"veh-{number:03d}", targets["mqtt"], args, run_id, self.recorder, self.stop_event)
+            for number in range(1, args.vehicles + 1)
+        ]
 
     def start(self):
         for vehicle in self.vehicles:
@@ -467,6 +563,9 @@ def run_experiment_once(args, targets, run_id):
         "alerts_received": len(fleet.recorder.alerts),
         "p95_local_alert_ms": fleet.recorder.p95_latency(origin_cloud=False),
         "p95_cloud_alert_ms": fleet.recorder.p95_latency(origin_cloud=True),
+        "handovers": fleet.recorder.counters.get("handovers", 0),
+        "handover_failures": fleet.recorder.counters.get("handover_failures", 0),
+        "p95_handover_ms": p95(fleet.recorder.handover_ms),
     }
 
 
@@ -498,9 +597,7 @@ def run_fleet(args, targets, run_id):
         pass
     fleet.stop()
     fleet.recorder.write_alerts(run_id)
-    print(json.dumps({**fleet.recorder.counters, "alerts_received": len(fleet.recorder.alerts),
-                      "p95_local_alert_ms": fleet.recorder.p95_latency(False),
-                      "p95_cloud_alert_ms": fleet.recorder.p95_latency(True)}, indent=2))
+    print(json.dumps(fleet.recorder.summary(), indent=2))
 
 
 def parse_args():
