@@ -1,5 +1,3 @@
-"""V2X-SERVICE: consume eventos de SQS, los persiste en DynamoDB de forma idempotente,
-detecta condiciones de alerta, las publica en SNS y muestra el estado en un dashboard."""
 import hashlib
 import json
 import os
@@ -13,14 +11,11 @@ from flask import Flask, jsonify, render_template
 
 REQUIRED_FIELDS = ("event_id", "source_id", "event_type", "event_time")
 
-
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-
 def parse_time(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
 
 def percentile_95(values):
     if not values:
@@ -28,9 +23,7 @@ def percentile_95(values):
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
 
-
 def build_alert(alert_type, event, key, severity, message):
-    """El alert_id es determinista: reprocesar un evento nunca crea una alerta distinta."""
     digest = hashlib.sha1(f"{alert_type}|{event['location']}|{key}".encode()).hexdigest()[:16]
     return {
         "alert_id": f"alrt-{digest}",
@@ -45,10 +38,9 @@ def build_alert(alert_type, event, key, severity, message):
         "message": message,
     }
 
-
 class AlertEngine:
-    """Reglas de la nube. La congestión de un solo tramo la detecta su RSU; aquí solo se alerta
-    cuando la congestión abarca vehículos de al menos min_rsus RSU distintas."""
+    """La congestión de un solo tramo la detecta su RSU. Aquí solo se alerta
+    cuando la congestión abarca vehículos de ambas RSU."""
 
     def __init__(self, congestion_threshold=3, window_s=30, min_rsus=2):
         self.threshold = congestion_threshold
@@ -77,7 +69,6 @@ class AlertEngine:
         self.fired.add(key)
         return [build_alert("congestion", event, bucket, "medium",
                             f"{len(vehicles)} vehículos en congestión entre {', '.join(sorted(rsus))}")]
-
 
 class V2XService:
     def __init__(self, table, publish_alert, engine=None):
@@ -208,7 +199,6 @@ class V2XService:
         with self.lock:
             return {**self.metrics, "p95_cloud_latency_ms": percentile_95(list(self.latencies))}
 
-
 def sqs_listener(service, sqs, queue_url):
     print("Esperando eventos de la cola SQS")
     while True:
@@ -231,13 +221,12 @@ def sqs_listener(service, sqs, queue_url):
                 service._count("errors")
                 print(f"Error procesando mensaje: {exc}")
 
-
 def create_app(service):
     app = Flask(__name__)
 
     @app.route("/")
     def index():
-        # templates/dashboard.html: HTML, CSS y JavaScript del dashboard en un solo fichero.
+        #HTML, CSS y JavaScript en un solo fichero.
         return render_template("dashboard.html")
 
     @app.route("/api/vehicles")
@@ -255,7 +244,6 @@ def create_app(service):
         return jsonify(service.snapshot())
 
     return app
-
 
 def retry_until_ok(action, description):
     while True:
@@ -285,7 +273,6 @@ def main():
     service = V2XService(table, lambda body: sns.publish(TopicArn=topic_arn, Message=body))
     threading.Thread(target=sqs_listener, args=(service, sqs, queue_url), daemon=True).start()
     create_app(service).run(host="0.0.0.0", port=5000)
-
 
 if __name__ == "__main__":
     main()
