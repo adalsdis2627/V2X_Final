@@ -450,6 +450,40 @@ def final_state_ok(table, items):
     return bool(latest)
 
 
+def set_fault(args, targets, active):
+    """Inyecta (active=True) o deshace el fallo del experimento."""
+    if args.experiment == "disconnect":
+        http_json(f"{targets['rsu_http']['rsu-1']}/admin/link", {"up": not active})
+    else:
+        targets["service_control"]("stop" if active else "start")
+
+
+def run_outage(args, targets, run_id):
+    """Mantiene el fallo durante --outage s y lo deshace siempre, aunque se interrumpa con Ctrl+C."""
+    set_fault(args, targets, active=True)
+    print(f"[{run_id}] fallo inyectado durante {args.outage} s")
+    try:
+        time.sleep(args.outage)
+    finally:
+        set_fault(args, targets, active=False)
+
+
+def recover_leftover_fault(targets):
+    """Deshace un corte que haya quedado de un experimento interrumpido. Devuelve lo restaurado."""
+    restored = []
+    for rsu, url in targets["rsu_http"].items():
+        metrics = try_http_json(f"{url}/metrics")
+        if metrics is None:
+            raise SystemExit(f"{rsu} no responde en {url}/metrics")
+        if not metrics.get("link_up", True):
+            http_json(f"{url}/admin/link", {"up": True})
+            restored.append(rsu)
+    if try_http_json(f"{targets['service_http']}/api/metrics") is None:
+        targets["service_control"]("start")
+        restored.append("v2x-service")
+    return restored
+
+
 def run_experiment_once(args, targets, run_id):
     import boto3
 
@@ -464,6 +498,27 @@ def run_experiment_once(args, targets, run_id):
         return int(attrs["ApproximateNumberOfMessages"]), int(attrs["ApproximateNumberOfMessagesNotVisible"])
 
     rsus = list(targets["rsu_http"].items())
+
+    # Comprobaciones previas: sin ellas, los resultados mezclan datos de otros intentos.
+    previous = len(stored_events(table, run_id))
+    if previous:
+        raise SystemExit(f"DynamoDB ya tiene {previous} eventos con run_id '{run_id}' de un intento anterior: "
+                         "lanzar el experimento con otro --run-id")
+    for name in recover_leftover_fault(targets):
+        print(f"[{run_id}] AVISO: {name} seguía con el fallo de un experimento interrumpido; restaurado")
+
+    def idle():
+        if try_http_json(f"{targets['service_http']}/api/metrics") is None or sum(queue_depth(queue_url)):
+            return False
+        return all((try_http_json(f"{url}/metrics") or {}).get("buffered", 1) == 0 for _, url in rsus)
+
+    deadline = time.monotonic() + args.drain_timeout
+    while not idle():
+        if time.monotonic() > deadline:
+            raise SystemExit(f"El sistema sigue con eventos pendientes tras {args.drain_timeout} s: "
+                             "revisar los buffers de las RSU y la cola antes de medir")
+        print(f"[{run_id}] esperando a que se vacíen los buffers y la cola antes de empezar")
+        time.sleep(2)
     counters = {name: CumulativeCounter() for name in (
         "duplicates", "redelivered", "out_of_order", "out_of_order_same_rsu", "out_of_order_cross_rsu", "errors")}
     rsu_totals = {f"{rsu}:{name}": CumulativeCounter() for rsu, _ in rsus
@@ -507,19 +562,9 @@ def run_experiment_once(args, targets, run_id):
 
     print(f"[{run_id}] calentamiento de {args.warmup} s")
     time.sleep(args.warmup)
-    rsu_url = targets["rsu_http"]["rsu-1"]
-    if args.experiment == "disconnect":
-        http_json(f"{rsu_url}/admin/link", {"up": False})
-    else:
-        targets["service_control"]("stop")
-    print(f"[{run_id}] fallo inyectado durante {args.outage} s")
-    time.sleep(args.outage)
-    if args.experiment == "disconnect":
-        http_json(f"{rsu_url}/admin/link", {"up": True})
-    else:
-        targets["service_control"]("start")
+    run_outage(args, targets, run_id)
     restored_at = round(time.monotonic() - marks["start"], 1)
-    # Referencia para contar solo el desorden posterior a la restauración (precisión de ±1 s de muestreo).
+    # Referencia para contar solo el desorden posterior a la restauración (precisión de un intervalo de muestreo: ~1 s en local, ~2 s en AWS).
     at_restore = {name: counters[name].total for name in ("out_of_order_same_rsu", "out_of_order_cross_rsu")}
     print(f"[{run_id}] restaurado; tráfico durante {args.cooldown} s más")
     time.sleep(args.cooldown)

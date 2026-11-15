@@ -12,7 +12,10 @@ Los vehículos simulados publican eventos por MQTT en su RSU. Cada RSU filtra lo
 | `Dockerfile` | Dos imágenes desde un mismo fichero: `--target rsu` y `--target service` |
 | `test_v2x.py` | Pruebas unitarias (pytest) |
 | `.github/workflows/deploy.yml` | Pipeline de pruebas, imágenes, infraestructura y despliegue |
-| `INSTRUCTIONS_AWS.md` | Los mismos pasos que el pipeline, para hacerlos a mano |
+| `docs_markdown/PRUEBAS_UNITARIAS.md` | Qué comprueba cada prueba de `test_v2x.py` y cómo se aíslan las dependencias externas |
+| `docs_markdown/PRUEBAS_LOCAL.md` | Pruebas del sistema completo en local con LocalStack y cómo interpretar sus resultados |
+| `docs_markdown/EXPERIMENTOS_AWS.md` | Experimentos definitivos en AWS y cómo interpretar sus CSV para la memoria |
+| `docs_markdown/EXPERIMENTOS_AWS_linux.md` | La misma guía, con los comandos para Linux |
 
 ## 1. Qué despliega `deploy.yml`
 
@@ -49,7 +52,7 @@ Prepara Python 3.10, instala `requirements.txt` y ejecuta `pytest test_v2x.py`.
 | Falla alguna prueba | Un cambio ha roto la lógica. Reprodúcelo en local con `pytest test_v2x.py` |
 | Falla `pip install` | Versión fijada en `requirements.txt` inexistente o caída temporal de PyPI. Relanza o corrige la versión |
 
-**Qué comprueba `test_v2x.py`.** Son 49 pruebas unitarias que se ejecutan en segundos y sin AWS, MQTT ni Docker. DynamoDB, SQS, SNS y el broker se sustituyen por objetos en memoria, así que verifican la lógica del código, no la integración con los servicios reales.
+**Qué comprueba `test_v2x.py`.** Son 57 pruebas unitarias que se ejecutan en segundos y sin AWS, MQTT ni Docker. DynamoDB, SQS, SNS y el broker se sustituyen por objetos en memoria, así que verifican la lógica del código, no la integración con los servicios reales. La tabla siguiente las resume por bloques; `docs_markdown/PRUEBAS_UNITARIAS.md` describe cada una por separado.
 
 | Bloque | Qué se verifica |
 |---|---|
@@ -58,10 +61,12 @@ Prepara Python 3.10, instala `requirements.txt` y ejecuta `pytest test_v2x.py`.
 | Buffer y reenvío | Con el enlace cortado los eventos se acumulan y salen en el mismo orden al restaurarlo. Un fallo de envío se reintenta con backoff, y si el buffer se llena se descarta primero la telemetría normal |
 | SNS por HTTP | Confirmación de la suscripción con el `Token`, lectura de notificaciones con `Content-Type: text/plain`, alertas duplicadas retransmitidas una sola vez, alertas para otra RSU ignoradas, topic ajeno rechazado (403) y respuesta 503 con el enlace cortado para que SNS reintente |
 | V2X-SERVICE | Un mismo evento recibido dos veces se guarda una sola vez y cuenta como duplicado. Un mensaje malformado lanza error para que acabe en la DLQ. Un evento antiguo no sobrescribe el estado del vehículo |
+| Clasificación del desorden | Un evento adelantado por otro más reciente del mismo vehículo se cuenta como desorden de misma RSU o de distinta RSU, según la RSU del evento que lo adelantó. Los duplicados no cuentan, y el total `out_of_order` es la suma de ambos |
 | Reglas de alerta | `road hazard` genera una única alerta dirigida a ambas RSU. La congestión en la nube requiere 3 vehículos distintos de al menos 2 RSU en la misma ventana de 30 s, y se dispara una vez; si solo afecta a una RSU, la nube no alerta. El `alert_id` es determinista, y una alerta que falló al publicarse se recupera cuando SQS reentrega el evento |
 | Congestión local en la RSU | Con 2 vehículos distintos en los últimos 30 s (ventana deslizante), la RSU alerta a su tramo. Los avisos repetidos de un mismo vehículo no cuentan, los antiguos salen de la ventana, se vuelve a alertar como mucho una vez cada 30 s y los eventos se siguen reenviando a la nube |
 | API del servicio | `/`, `/api/vehicles`, `/api/alerts` y `/api/metrics` responden con los datos esperados |
 | Simulador | Cada mitad del circuito corresponde a una RSU, eventos compatibles con la validación de la RSU y con `event_id` único, inyección de pérdida, duplicación y desorden, y contadores que se mantienen aunque el servicio se reinicie |
+| Control de experimentos | El fallo inyectado (corte de la RSU 1 o parada del servicio) se deshace aunque el experimento se interrumpa durante el corte. Un fallo que quedó de un experimento interrumpido se restaura antes de empezar, y un sistema en buen estado no se toca |
 | Cambio de RSU | El vehículo arranca en la RSU de su carril y solo cambia al pasar de una mitad a la otra (también al cerrar el circuito, del carril 4 al 1). Se conecta a la RSU nueva antes de cerrar la antigua, un evento retenido sale por la RSU a la que iba dirigido, un cambio fallido se reintenta en el siguiente evento y una alerta oída por las dos RSU se registra una sola vez |
 
 El funcionamiento del sistema completo no lo cubren estas pruebas. Se comprueba con la prueba en local de la sección 3 y en AWS.
@@ -107,7 +112,7 @@ Después espera a que esté *running* y guarda su DNS público para el paso 6.
 | `VPCIdNotSpecified` o fallo al crear el security group | La cuenta no tiene VPC por defecto. Créala desde **VPC → Actions → Create default VPC** |
 | Límite de instancias o de tipo | El laboratorio limita el número de instancias y sus tipos. Termina instancias sobrantes |
 | El DNS público sale vacío | La subred no asigna IP pública. Activa *Auto-assign public IPv4* en la subred por defecto |
-| Contenedores sin credenciales (se ve en el paso 6 o después) | Se reutilizó una instancia creada a mano sin `LabInstanceProfile`, sin hop limit 2 o sin Docker, y el workflow no corrige instancias existentes. Termínala y relanza, o corrígela como indica `INSTRUCTIONS_AWS.md` |
+| Contenedores sin credenciales (se ve en el paso 6 o después) | Se reutilizó una instancia creada a mano sin `LabInstanceProfile`, sin hop limit 2 o sin Docker, y el workflow no corrige instancias existentes. Termínala y relanza el workflow. Si solo falla el hop limit: `aws ec2 modify-instance-metadata-options --instance-id <id> --http-put-response-hop-limit 2 --http-endpoint enabled` y reinicia el contenedor |
 | Aparece una instancia de más | Había varias instancias con la misma etiqueta y el workflow usa solo la primera. Termina las sobrantes |
 
 ### Paso 6. Despliegue de contenedores
@@ -137,11 +142,36 @@ Después espera a que esté *running* y guarda su DNS público para el paso 6.
 
 `LAB_SSH_KEY` solo se configura una vez, salvo que el laboratorio genere una clave nueva.
 
+### Entorno virtual de Python
+Los simuladores y las pruebas se ejecutan en el portátil con Python 3.10 o superior. Para no instalar las librerías en el Python del sistema y evitar conflictos con otros proyectos, se usa un entorno virtual (`venv`, incluido en Python) dentro de la carpeta del proyecto. Se crea una sola vez:
+
+**PowerShell**
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt pytest
+```
+
+**CMD**
+```bat
+python -m venv .venv
+.venv\Scripts\activate.bat
+pip install -r requirements.txt pytest
+```
+
+Después, en cada terminal nueva basta con activarlo (`.venv\Scripts\Activate.ps1` en PowerShell o `.venv\Scripts\activate.bat` en CMD). Con el entorno activo, el indicador de la terminal empieza por `(.venv)` y todos los comandos `python` y `pytest` de este README lo usan. Para salir: `deactivate`.
+
+- **PowerShell bloquea `Activate.ps1`** ("la ejecución de scripts está deshabilitada"): ejecuta una vez `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, o usa el intérprete del entorno sin activarlo: `.venv\Scripts\python.exe vehicle_simulator.py ...`.
+- **Varias versiones de Python instaladas:** `python -m venv` usa la que aparece primero en el `PATH`. Para elegir una concreta, crea el entorno con el lanzador de Windows: `py -3.10 -m venv .venv`.
+- **Aviso `A new release of pip is available`:** es informativo y no afecta a la instalación.
+- **Un coche por terminal** con `vehicle_simulator_single.py`: hay que activar el entorno en cada terminal, o usar `.venv\Scripts\python.exe` directamente.
+- **No subir `.venv` al repositorio:** si el repo tiene `.gitignore`, añade la línea `.venv/`.
+- `ssh`, `docker` y las credenciales de `C:\Users\<usuario>\.aws\credentials` están fuera del entorno y funcionan igual.
+
 ### Simulador de vehículos
-Se ejecuta en el portátil, con Python 3.10 o superior:
+Con el entorno virtual activo:
 
 ```bash
-pip install -r requirements.txt
 python vehicle_simulator.py --duration 120
 ```
 
@@ -170,8 +200,8 @@ python vehicle_simulator_single.py --id 4 --rsu 2 --rate 1
 | Fichero | Cuándo se crea | Contenido |
 |---|---|---|
 | `<run_id>_alerts.csv` | En toda ejecución | Una fila por alerta recibida por cada vehículo: vehículo, `alert_id`, tipo, origen (`rsu-1`, `rsu-2` o `cloud`) y latencia en ms desde el evento que la provocó. Ambos instantes los toma el reloj del portátil, así que no hay desfase entre máquinas |
-| `<run_id>_timeline.csv` | Solo en experimentos, uno por repetición | Una muestra por segundo: mensajes en la cola SQS, eventos en el buffer de cada RSU, si el servicio responde y cuántos eventos lleva procesados, y el total pendiente (`backlog`). Sirve para las gráficas de acumulación y vaciado |
-| `<run_id>_summary.csv` | Solo en experimentos, al terminar todas las repeticiones | Una fila por repetición: eventos generados, reenviados por las RSU y guardados en DynamoDB, pérdidas, picos de buffer y de cola, reintentos, duplicados, reentregas, eventos desordenados, mensajes en la DLQ, tiempo de recuperación, coherencia del estado final, p95 de latencia de las alertas locales y de la nube, y cambios de RSU (realizados, fallidos y p95 de su duración) |
+| `<run_id>_timeline.csv` | Solo en experimentos, uno por repetición | Una muestra cada 1-2 s (~1 s en local, ~2 s en AWS): mensajes en la cola SQS, eventos en el buffer de cada RSU, si el servicio responde y cuántos eventos lleva procesados, y el total pendiente (`backlog`). Sirve para las gráficas de acumulación y vaciado |
+| `<run_id>_summary.csv` | Solo en experimentos, al terminar todas las repeticiones | Una fila por repetición: eventos generados, reenviados por las RSU y guardados en DynamoDB, pérdidas, picos de buffer y de cola, reintentos, duplicados, reentregas, eventos desordenados (total, de misma RSU y de distinta RSU, en toda la ejecución y solo tras la restauración: `out_of_order_*_after_restore`, con la precisión del muestreo, de 1-2 s), mensajes en la DLQ, tiempo de recuperación, coherencia del estado final, p95 de latencia de las alertas locales y de la nube, y cambios de RSU (realizados, fallidos y p95 de su duración) |
 
 Las pérdidas se calculan como eventos reenviados por las RSU menos eventos distintos guardados en DynamoDB. Así, la telemetría que la RSU filtra a propósito no cuenta como perdida.
 
@@ -181,8 +211,15 @@ python vehicle_simulator.py --experiment disconnect --repeat 3
 python vehicle_simulator.py --experiment failure --repeat 3 --ssh-key labsuser.pem
 ```
 
-- **`disconnect`:** corta el enlace de `rsu-1` con AWS durante 60 s. Los vehículos que pasan a la RSU 2 durante el corte dejan eventos en el buffer de la RSU 1, que llegan a la nube después que los más recientes enviados por la RSU 2. Aparecen como `cloud_out_of_order`, pero el estado final es correcto (`final_state_ok`).
-- **`failure`:** detiene `v2x-service` durante 60 s por SSH.
+- **`disconnect`:** corta el enlace de `rsu-1` con AWS durante 60 s. Los vehículos que pasan a la RSU 2 durante el corte dejan eventos en el buffer de la RSU 1, que llegan a la nube después que los más recientes enviados por la RSU 2. Aparecen como `cloud_out_of_order`, pero el estado final es correcto (`final_state_ok`). Para separar las causas, el resumen divide ese desorden en `cloud_out_of_order_same_rsu` y `cloud_out_of_order_cross_rsu`. `out_of_order_cross_rsu_after_restore` recoge los vehículos que cambiaron a la RSU 2 durante el corte. `out_of_order_same_rsu_after_restore` no es 0 aunque el buffer de la RSU sea FIFO: al vaciar de golpe decenas de mensajes, SQS estándar los entrega desordenados. En AWS salieron entre 10 y 47 por repetición. En LocalStack sale ~0, porque su cola se comporta casi como FIFO.
+- **`failure`:** detiene `v2x-service` durante 60 s por SSH. Al volver, el servicio vacía una cola de ~100 mensajes, y SQS estándar vuelve a desordenarlos (`out_of_order_same_rsu` entre 53 y 75 en AWS). Aquí `out_of_order_cross_rsu` también lo causa SQS, no un buffer: es el coche que cambió de RSU durante el corte y cuyo evento más reciente se procesó antes. La recuperación (10-15 s) es casi toda el arranque del contenedor.
+
+**Comprobaciones previas de cada repetición.** Antes de generar tráfico, el simulador:
+- Se detiene si DynamoDB ya tiene eventos con ese `run_id`. Mezclarían datos de un intento anterior y darían pérdidas negativas, así que hay que usar otro `--run-id`.
+- Restaura, con un aviso, el enlace de una RSU que siga cortado o el servicio si está parado. Es lo que queda tras un experimento interrumpido.
+- Espera a que se vacíen los buffers de las RSU y la cola, hasta `--drain-timeout`.
+
+El corte se deshace siempre al terminar `--outage`, aunque el experimento se interrumpa con Ctrl+C o falle a mitad.
 
 Los tiempos se ajustan con `--warmup`, `--outage` y `--cooldown`. Los CSV que generan se describen en el apartado anterior.
 

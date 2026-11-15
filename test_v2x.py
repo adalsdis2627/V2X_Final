@@ -586,3 +586,72 @@ def test_cumulative_counter_survives_restart():
     for value in (5, 8, None, 2, 4):
         counter.update(value)
     assert counter.total == 7
+
+
+def fake_targets(calls, rsu_metrics=None, service_up=True):
+    """Infraestructura simulada para las funciones de experimento: registra cada acción en calls."""
+    return {
+        "rsu_http": {"rsu-1": "http://rsu1", "rsu-2": "http://rsu2"},
+        "service_http": "http://service",
+        "service_control": calls.append,
+        "_metrics": rsu_metrics or {},
+        "_service_up": service_up,
+    }
+
+
+@pytest.fixture
+def fake_http(monkeypatch):
+    """Sustituye las llamadas HTTP del simulador: devuelve las métricas de fake_targets y anota los POST."""
+    state = {}
+
+    def try_http_json(url):
+        targets = state["targets"]
+        if url.startswith(targets["service_http"]):
+            return {"processed": 0} if targets["_service_up"] else None
+        rsu = next(r for r, base in targets["rsu_http"].items() if url.startswith(base))
+        return targets["_metrics"].get(rsu, {"link_up": True, "buffered": 0})
+
+    def http_json(url, data=None):
+        state["calls"].append((url, data))
+
+    monkeypatch.setattr(vehicle_simulator, "try_http_json", try_http_json)
+    monkeypatch.setattr(vehicle_simulator, "http_json", http_json)
+
+    def use(calls, **kwargs):
+        state["calls"] = calls
+        state["targets"] = fake_targets(calls, **kwargs)
+        return state["targets"]
+
+    return use
+
+
+@pytest.mark.parametrize("experiment, expected", [
+    ("disconnect", [("http://rsu1/admin/link", {"up": False}), ("http://rsu1/admin/link", {"up": True})]),
+    ("failure", ["stop", "start"]),
+])
+def test_fault_is_undone_even_if_the_experiment_is_interrupted(monkeypatch, fake_http, experiment, expected):
+    calls = []
+    targets = fake_http(calls)
+
+    def interrupted_sleep(_seconds):
+        raise KeyboardInterrupt  # Ctrl+C durante el corte.
+
+    monkeypatch.setattr(vehicle_simulator.time, "sleep", interrupted_sleep)
+    args = SimpleNamespace(experiment=experiment, outage=60)
+    with pytest.raises(KeyboardInterrupt):
+        vehicle_simulator.run_outage(args, targets, "test")
+    assert calls == expected
+
+
+def test_leftover_fault_from_an_interrupted_experiment_is_restored(fake_http):
+    calls = []
+    targets = fake_http(calls, rsu_metrics={"rsu-1": {"link_up": False, "buffered": 40}}, service_up=False)
+    assert vehicle_simulator.recover_leftover_fault(targets) == ["rsu-1", "v2x-service"]
+    assert calls == [("http://rsu1/admin/link", {"up": True}), "start"]
+
+
+def test_clean_system_is_left_untouched(fake_http):
+    calls = []
+    targets = fake_http(calls)
+    assert vehicle_simulator.recover_leftover_fault(targets) == []
+    assert calls == []
