@@ -1,5 +1,3 @@
-"""Roadside Unit: valida y filtra eventos MQTT, genera alertas locales,
-reenvía a SQS con buffer y retransmite las alertas de SNS (HTTP) a sus vehículos."""
 import json
 import os
 import re
@@ -16,10 +14,8 @@ REQUIRED_FIELDS = ("event_id", "source_id", "event_type", "event_time", "locatio
 SOURCE_ID_RE = re.compile(r"^[\w-]{1,32}$")
 MAX_BACKOFF_S = 30
 
-
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
 
 def validate_event(event):
     """Devuelve el motivo del rechazo, o None si el evento es válido."""
@@ -42,9 +38,8 @@ def validate_event(event):
         return "invalid event_time"
     return None
 
-
 class SeenIds:
-    """Conjunto LRU de identificadores, para detectar duplicados con memoria acotada."""
+    """Conjunto LRU de identificadores, para detectar duplicados."""
 
     def __init__(self, capacity=20000):
         self.capacity = capacity
@@ -58,7 +53,6 @@ class SeenIds:
         if len(self.items) > self.capacity:
             self.items.popitem(last=False)
         return False
-
 
 class Rsu:
     def __init__(self, rsu_id, send_to_cloud, publish_mqtt, confirm_subscription=None, topic_arn=None,
@@ -134,11 +128,10 @@ class Rsu:
         return "accepted"
 
     def _check_local_congestion(self, event):
-        """Ventana deslizante sobre los últimos congestion_window_s segundos de este tramo.
+        """Ventana deslizante sobre los últimos 30s segundos de este tramo.
 
         Devuelve el número de vehículos distintos si hay que alertar, o 0. Mientras la congestión
-        persista, se vuelve a alertar como mucho una vez por ventana. Se llama con el lock tomado.
-        """
+        persista, se vuelve a alertar como mucho una vez por ventana."""
         now = self.clock()
         self.congestion_reports.append((now, event["source_id"]))
         while now - self.congestion_reports[0][0] > self.congestion_window_s:
