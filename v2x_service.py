@@ -3,7 +3,7 @@ detecta condiciones de alerta, las publica en SNS y muestra el estado en un dash
 import hashlib
 import json
 import os
-import threading
+import threading 
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
